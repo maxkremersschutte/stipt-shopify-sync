@@ -1,8 +1,12 @@
 
 name: Stipt Shopify Automatische Synchronisatie
 
+
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '17 * * * *'
+  
 
 permissions:
   contents: read
