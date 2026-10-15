@@ -134,8 +134,9 @@ for product in source:
         continue
 
     options = product.get('options') or []
-    if len(options) == 1 and options[0].get('name') == 'Title' and all(v.get('title') == 'Default Title' for v in variants):
-        options = []
+    # productSet requires optionValues for every variant, including Default Title.
+    if not options and len(variants) == 1:
+        options = [{'name': 'Title', 'position': 1, 'values': ['Default Title']}]
     definitions = []
     for option in options:
         values = [{'name': str(v)} for v in option.get('values', []) if v]
@@ -156,11 +157,13 @@ for product in source:
         }
         if variant.get('sku'):
             item['sku'] = str(variant['sku'])
-        if definitions:
-            item['optionValues'] = [
-                {'optionName': option['name'], 'name': str(variant['option' + str(option['position'])])}
-                for option in options if variant.get('option' + str(option['position'])) is not None
-            ]
+        item['optionValues'] = [
+            {'optionName': option['name'],
+             'name': str(variant.get('option' + str(option['position'])) or ('Default Title' if option['name'] == 'Title' and len(variants) == 1 else ''))}
+            for option in options
+        ]
+        if not item['optionValues'] or any(not value['name'] for value in item['optionValues']):
+            raise ValueError(f'Missing option value for {title}')
         variant_inputs.append(item)
 
     payload = {
