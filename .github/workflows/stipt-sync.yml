@@ -1,0 +1,38 @@
+
+name: Stipt Product Synchronisatie
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 * * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Repository ophalen
+        uses: actions/checkout@v4
+
+      - name: Python installeren
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Benodigde bibliotheken installeren
+        run: pip install requests
+
+      - name: Stipt producten ophalen
+        run: python stipt_sync.py
+
+      - name: Resultaten bewaren
+        uses: actions/upload-artifact@v4
+        with:
+          name: stipt-producten
+          path: |
+            *.csv
+            *.xlsx
+          if-no-files-found: warn
