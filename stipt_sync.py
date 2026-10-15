@@ -1,105 +1,209 @@
-import os, sys, time, json, logging
-from decimal import Decimal
+import os
+import sys
+import time
+import logging
+from decimal import Decimal, InvalidOperation
+
 import requests
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s %(message)s')
-SHOP = os.getenv('SHOPIFY_SHOP_DOMAIN','jsmtools.myshopify.com').replace('https://','').strip('/')
+SHOP = os.getenv('SHOPIFY_SHOP_DOMAIN', '').replace('https://', '').replace('http://', '').strip().strip('/')
+if SHOP != 'jsmtools.myshopify.com':
+    sys.exit('Unexpected or missing SHOPIFY_SHOP_DOMAIN')
+for key in ('SHOPIFY_CLIENT_ID', 'SHOPIFY_CLIENT_SECRET'):
+    if not os.getenv(key):
+        sys.exit(f'Missing GitHub secret: {key}')
+
 API = f'https://{SHOP}/admin/api/2026-10/graphql.json'
 SOURCE = 'https://www.stiptpolishpointshop.nl/products.json?limit=250'
-S = requests.Session()
+SESSION = requests.Session()
 
-def request(method, url, **kw):
-    for n in range(5):
+
+def request(method, url, **kwargs):
+    for attempt in range(5):
         try:
-            r=S.request(method,url,timeout=45,**kw)
-            if r.status_code in (429,500,502,503,504):
-                time.sleep(min(2**n*2,25));continue
-            r.raise_for_status();return r.json()
-        except (requests.Timeout,requests.ConnectionError):
-            if n==4:raise
-            time.sleep(2**n*2)
-    raise RuntimeError('Request failed: '+url)
+            response = SESSION.request(method, url, timeout=45, **kwargs)
+            if response.status_code in (429, 500, 502, 503, 504):
+                time.sleep(min(2 ** attempt * 2, 25))
+                continue
+            response.raise_for_status()
+            return response.json()
+        except (requests.Timeout, requests.ConnectionError):
+            if attempt == 4:
+                raise
+            time.sleep(2 ** attempt * 2)
+    raise RuntimeError('Request failed after retries')
 
-def gql(q, variables=None):
-    data=request('POST',API,headers={'X-Shopify-Access-Token':TOKEN},json={'query':q,'variables':variables or {}})
-    if data.get('errors'):raise RuntimeError(str(data['errors']))
-    return data['data']
 
-for key in ('SHOPIFY_CLIENT_ID','SHOPIFY_CLIENT_SECRET'):
-    if not os.getenv(key):sys.exit(f'Missing secret: {key}')
-if SHOP != 'jsmtools.myshopify.com':sys.exit('Unexpected shop domain')
+token_response = request('POST', f'https://{SHOP}/admin/oauth/access_token', data={
+    'grant_type': 'client_credentials',
+    'client_id': os.environ['SHOPIFY_CLIENT_ID'],
+    'client_secret': os.environ['SHOPIFY_CLIENT_SECRET'],
+})
+TOKEN = token_response.get('access_token')
+if not TOKEN:
+    sys.exit('Shopify did not return an access token')
 
-token_data=request('POST',f'https://{SHOP}/admin/oauth/access_token',data={'grant_type':'client_credentials','client_id':os.environ['SHOPIFY_CLIENT_ID'],'client_secret':os.environ['SHOPIFY_CLIENT_SECRET']})
-TOKEN=token_data.get('access_token')
-if not TOKEN:sys.exit('Shopify authentication failed (check app/store organization and scopes)')
-required={'read_products','write_products','read_inventory','write_inventory','read_locations'}
-scopes=set(token_data.get('scope','').split(','))
-if not required.issubset(scopes):sys.exit('Missing Shopify scopes: '+', '.join(sorted(required-scopes)))
+# Shopify may not list implied read scopes separately when write scopes are granted.
+scopes = {x.strip() for x in token_response.get('scope', '').split(',') if x.strip()}
+required = {'write_products', 'write_inventory', 'read_locations'}
+if scopes and not required.issubset(scopes):
+    sys.exit('Missing Shopify scopes: ' + ', '.join(sorted(required - scopes)))
 
-source=request('GET',SOURCE).get('products',[])
-if len(source)<100:sys.exit(f'Source returned only {len(source)} products; refusing to sync')
-ids=[p['id'] for p in source]
-if len(set(ids))!=len(ids):sys.exit('Duplicate supplier IDs')
 
-locs=gql('query { locations(first: 50) { nodes { id name isActive } } }')['locations']['nodes']
-loc_id=os.getenv('SHOPIFY_LOCATION_ID','')
-active=[x for x in locs if x['isActive']]
-if not loc_id:
-    if len(active)!=1:sys.exit('Multiple active locations: set SHOPIFY_LOCATION_ID GitHub secret to the correct location GID')
-    loc_id=active[0]['id']
-if loc_id not in {x['id'] for x in active}:sys.exit('Location ID not found or inactive')
+def gql(query, variables=None):
+    result = request('POST', API, headers={'X-Shopify-Access-Token': TOKEN}, json={
+        'query': query,
+        'variables': variables or {},
+    })
+    if result.get('errors'):
+        raise RuntimeError(str(result['errors']))
+    return result['data']
 
-existing={}
-cursor=None
+
+source = request('GET', SOURCE).get('products', [])
+if len(source) < 100:
+    sys.exit(f'Supplier returned only {len(source)} products; sync aborted')
+source_ids = [str(p['id']) for p in source]
+if len(source_ids) != len(set(source_ids)):
+    sys.exit('Duplicate supplier product IDs; sync aborted')
+logging.info('Supplier products: %s', len(source))
+
+locations = gql('query { locations(first: 50) { nodes { id name isActive } } }')['locations']['nodes']
+active = [x for x in locations if x['isActive']]
+location_id = os.getenv('SHOPIFY_LOCATION_ID', '').strip()
+if not location_id:
+    if len(active) != 1:
+        sys.exit('Multiple active Shopify locations: set SHOPIFY_LOCATION_ID as a GitHub secret')
+    location_id = active[0]['id']
+if location_id not in {x['id'] for x in active}:
+    sys.exit('SHOPIFY_LOCATION_ID is not an active Shopify location')
+
+# Only products with our persistent supplier ID are safe to update.
+# We deliberately do not match by SKU or title, which may belong to another supplier.
+existing = {}
+cursor = None
 while True:
-    data=gql('query($after:String){ products(first:100,after:$after,query:"vendor:Stipt") { pageInfo { hasNextPage endCursor } nodes { id handle title vendor metafield(namespace:"custom",key:"stipt_source_id") { value } variants(first:100) { nodes { id sku } } } } }',{'after':cursor})['products']
-    for p in data['nodes']:
-        sid=(p.get('metafield') or {}).get('value')
-        if sid:existing[str(sid)]=p
-    if not data['pageInfo']['hasNextPage']:break
-    cursor=data['pageInfo']['endCursor']
+    page = gql('''query($after:String) {
+      products(first:100, after:$after, query:"tag:Stipt automatische sync") {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id title status
+          metafield(namespace:"custom", key:"stipt_source_id") { value }
+        }
+      }
+    }''', {'after': cursor})['products']
+    for product in page['nodes']:
+        source_id = (product.get('metafield') or {}).get('value')
+        if source_id:
+            if source_id in existing:
+                sys.exit(f'Duplicate existing source ID {source_id}; sync aborted')
+            existing[source_id] = product
+    if not page['pageInfo']['hasNextPage']:
+        break
+    cursor = page['pageInfo']['endCursor']
 
-# Do not guess regular prices: any discounted variant is skipped until verified.
-# For non-discounted variants the public price is used as displayed by supplier.
-MUT='''mutation($input:ProductSetInput!){ productSet(input:$input,synchronous:true){ product { id title } userErrors { field message } } }'''
-created=updated=skipped=failed=0
-for p in source:
-    sid=str(p['id']); old=existing.get(sid)
-    variants=p.get('variants') or []
-    if not variants or len(variants)>100:
-        logging.warning('Skip %s: missing/too many variants',p.get('title'));skipped+=1;continue
-    if any(v.get('compare_at_price') and Decimal(str(v['compare_at_price']))>Decimal(str(v['price'])) for v in variants):
-        logging.warning('Skip discounted product %s: regular price requires verification',p['title']);skipped+=1;continue
-    if any(v.get('price') is None for v in variants):
-        logging.warning('Skip missing price %s',p['title']);skipped+=1;continue
-    opts=p.get('options') or []
-    if len(opts)==1 and opts[0].get('name')=='Title' and all(v.get('title')=='Default Title' for v in variants):opts=[]
-    option_defs=[]
-    for o in opts:
-        values=[{'name':str(v)} for v in o.get('values',[]) if v]
-        if values:option_defs.append({'name':o['name'],'position':o['position'],'values':values})
-    vs=[]
-    for v in variants:
-        x={'price':str(v['price']),'inventoryPolicy':'DENY','inventoryItem':{'tracked':True},'inventoryQuantities':[{'locationId':loc_id,'name':'available','quantity':100 if v.get('available') else 0}]}
-        if v.get('sku'):x['sku']=str(v['sku'])
-        if option_defs:x['optionValues']=[{'optionName':o['name'],'name':str(v.get('option'+str(o['position'])))} for o in opts if v.get('option'+str(o['position']))]
-        vs.append(x)
-    inp={'title':p['title'],'descriptionHtml':p.get('body_html') or '', 'vendor':'Stipt','status':'DRAFT' if not old else 'ACTIVE','tags':['Stipt','Stipt automatische sync'], 'metafields':[{'namespace':'custom','key':'stipt_source_id','type':'single_line_text_field','value':sid}], 'variants':vs}
-    if old:inp['id']=old['id']
-    if option_defs:inp['productOptions']=option_defs
-    if not old:
-        imgs=[i.get('src') for i in p.get('images',[]) if i.get('src')]
-        if imgs:inp['files']=[{'originalSource':u,'contentType':'IMAGE','alt':p['title']} for u in imgs[:15]]
+MUTATION = '''mutation($input:ProductSetInput!) {
+  productSet(input:$input, synchronous:true) {
+    product { id title status }
+    userErrors { field message }
+  }
+}'''
+
+created = updated = skipped = failed = 0
+for product in source:
+    title = product.get('title') or '(untitled)'
+    source_id = str(product['id'])
+    old = existing.get(source_id)
+    variants = product.get('variants') or []
+    if not variants or len(variants) > 100:
+        logging.warning('SKIP %s: invalid variant count', title)
+        skipped += 1
+        continue
     try:
-        result=gql(MUT,{'input':inp})['productSet']
-        if result['userErrors']:raise RuntimeError(str(result['userErrors']))
-        if not result['product']:raise RuntimeError('No product returned')
-        if old:updated+=1
-        else:created+=1
-        logging.info('%s %s', 'Updated' if old else 'Created DRAFT',p['title'])
-    except Exception as e:
-        failed+=1;logging.error('Failed %s: %s',p['title'],e)
+        for variant in variants:
+            price = Decimal(str(variant['price']))
+            if not price.is_finite() or price < 0:
+                raise ValueError('invalid price')
+            compare = variant.get('compare_at_price')
+            if compare not in (None, '') and Decimal(str(compare)) > price:
+                raise ValueError('discounted product; regular price not verified')
+    except (ValueError, TypeError, KeyError, InvalidOperation) as error:
+        logging.warning('SKIP %s: %s', title, error)
+        skipped += 1
+        continue
+
+    options = product.get('options') or []
+    if len(options) == 1 and options[0].get('name') == 'Title' and all(v.get('title') == 'Default Title' for v in variants):
+        options = []
+    definitions = []
+    for option in options:
+        values = [{'name': str(v)} for v in option.get('values', []) if v]
+        if values:
+            definitions.append({'name': option['name'], 'position': option['position'], 'values': values})
+
+    variant_inputs = []
+    for variant in variants:
+        item = {
+            'price': str(variant['price']),
+            'inventoryPolicy': 'DENY',
+            'inventoryItem': {'tracked': True},
+            'inventoryQuantities': [{
+                'locationId': location_id,
+                'name': 'available',
+                'quantity': 100 if variant.get('available') else 0,
+            }],
+        }
+        if variant.get('sku'):
+            item['sku'] = str(variant['sku'])
+        if definitions:
+            item['optionValues'] = [
+                {'optionName': option['name'], 'name': str(variant['option' + str(option['position'])])}
+                for option in options if variant.get('option' + str(option['position'])) is not None
+            ]
+        variant_inputs.append(item)
+
+    payload = {
+        'title': title,
+        'descriptionHtml': product.get('body_html') or '',
+        'vendor': 'Stipt',
+        'status': old['status'] if old else 'DRAFT',
+        'tags': ['Stipt', 'Stipt automatische sync'],
+        'metafields': [{
+            'namespace': 'custom', 'key': 'stipt_source_id',
+            'type': 'single_line_text_field', 'value': source_id,
+        }],
+        'variants': variant_inputs,
+    }
+    if old:
+        payload['id'] = old['id']
+    if definitions:
+        payload['productOptions'] = definitions
+    if not old:
+        image_urls = [image.get('src') for image in product.get('images', []) if image.get('src')]
+        if image_urls:
+            payload['files'] = [
+                {'originalSource': url, 'contentType': 'IMAGE', 'alt': title}
+                for url in image_urls[:15]
+            ]
+    try:
+        result = gql(MUTATION, {'input': payload})['productSet']
+        if result.get('userErrors'):
+            raise RuntimeError(str(result['userErrors']))
+        if not result.get('product'):
+            raise RuntimeError('No product returned')
+        if old:
+            updated += 1
+            logging.info('UPDATED %s', title)
+        else:
+            created += 1
+            logging.info('CREATED DRAFT %s', title)
+    except Exception as error:
+        failed += 1
+        logging.error('FAILED %s: %s', title, error)
     time.sleep(0.4)
-logging.info('Done: created drafts=%s updated=%s skipped=%s failed=%s',created,updated,skipped,failed)
-if failed:sys.exit(1)
+
+logging.info('Finished: created drafts=%s updated=%s skipped=%s failed=%s', created, updated, skipped, failed)
+if failed:
+    sys.exit(1)
 
